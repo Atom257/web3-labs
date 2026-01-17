@@ -1,0 +1,167 @@
+# ============================================
+# Time Ledger 项目 .gitignore
+# ============================================
+
+# ============================================
+# 环境变量和配置文件
+# ============================================
+.env
+.env.local
+.env.*.local
+*.env
+config.local.toml
+
+# ============================================
+# Go 后端相关
+# ============================================
+# 二进制文件
+timeledger-backend/bin/
+timeledger-backend/*.exe
+timeledger-backend/*.exe~
+timeledger-backend/*.dll
+timeledger-backend/*.so
+timeledger-backend/*.dylib
+timeledger-backend/server
+timeledger-backend/main
+
+# 测试覆盖率
+timeledger-backend/*.out
+timeledger-backend/coverage.txt
+timeledger-backend/coverage.html
+
+# Go 工作区
+timeledger-backend/vendor/
+go.work
+go.work.sum
+
+# IDE 和编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 调试文件
+__debug_bin*
+*.test
+
+# ============================================
+# Foundry/Solidity 合约相关
+# ============================================
+# 编译输出
+timeledger-contracts/cache/
+timeledger-contracts/out/
+timeledger-contracts/artifacts/
+
+# 广播日志（保留部署记录，忽略本地测试）
+!/timeledger-contracts/broadcast
+timeledger-contracts/broadcast/*/31337/
+timeledger-contracts/broadcast/**/dry-run/
+
+# 依赖库（通过 forge install 管理）
+timeledger-contracts/lib/
+
+# 文档生成
+timeledger-contracts/docs/
+
+# ============================================
+# 数据库和日志
+# ============================================
+# 数据库文件
+*.db
+*.sqlite
+*.sqlite3
+
+# 日志文件
+*.log
+logs/
+*.log.*
+
+# ============================================
+# 临时文件和备份
+# ============================================
+*.tmp
+*.temp
+*.bak
+*.backup
+*~
+.*.swp
+.*.swo
+
+# ============================================
+# 操作系统相关
+# ============================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.directory
+.Trash-*
+
+# ============================================
+# 敏感信息和密钥
+# ============================================
+# 私钥文件
+*.key
+*.pem
+*.p12
+*.pfx
+keystore/
+secrets/
+
+# 部署记录中的敏感信息（如果需要）
+# timeledger-contracts/broadcast/**/*.json
+
+# ============================================
+# 开发工具
+# ============================================
+# Node.js (如果使用)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# Python (如果使用脚本)
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+env/
+
+# ============================================
+# 构建和部署
+# ============================================
+dist/
+build/
+*.tar.gz
+*.zip
+
+# ============================================
+# 测试和覆盖率
+# ============================================
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+
+# ============================================
+# 其他
+# ============================================
+# 本地笔记和草稿
+TODO.local.md
+NOTES.local.md
+scratch/

@@ -1,0 +1,42 @@
+[app]
+name = "timeledger"
+timezone = "UTC"
+
+[database]
+max_open_conns = 50 # 数据库最大打开连接数
+max_idle_conns = 10 # 数据库最大空闲连接数
+
+[redis]
+key_prefix = "timeledger"
+
+# ---------------- Chains ----------------
+
+[[chains]]
+name = "sepolia"
+chain_id = 11155111
+type = "ethereum"               # ethereum | opstack
+rpc_env_key = "SEPOLIA_RPC_URL" # RPC 地址对应的环境变量名
+confirmations = 6               # 交易确认数（达到该确认数后认为交易最终确认）
+chunk_size = 10                 # 每次同步的区块数量（Alchemy 测试 RPC 限制）
+request_delay_ms = 100          # 每次请求之间的延迟（毫秒），避免请求过快
+
+[[chains.contracts]]
+address = "0xBEfe9d9726c3BFD513b6aDd74B243a82b272C073"
+start_block = 10032808
+token_decimals = 18
+
+# -------------------------------
+
+[[chains]]
+name = "base-sepolia"
+chain_id = 84532
+type = "opstack"                     # 链类型（OP Stack 系）
+rpc_env_key = "BASE_SEPOLIA_RPC_URL" # RPC 地址对应的环境变量名
+reorg_window = 200                   # 可能发生区块重组的回溯窗口大小（区块数）
+chunk_size = 10                      # 每次同步的区块数量（Alchemy 测试 RPC 限制）
+request_delay_ms = 200               # 每次请求之间的延迟（毫秒），避免请求过快
+
+[[chains.contracts]]
+address = "0xB8a31EaC0874DC6f5a28FCa601336Ae32c723dF6"
+start_block = 36257957
+token_decimals = 18

@@ -1,0 +1,49 @@
+# ============================================
+# Go 后端项目 .gitignore
+# ============================================
+
+# 二进制文件
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+server
+main
+
+# 测试覆盖率
+*.out
+coverage.txt
+coverage.html
+*.test
+
+# Go 工作区
+vendor/
+
+# 环境变量和配置
+.env
+.env.local
+*.env
+config.local.toml
+
+# 日志文件
+*.log
+logs/
+
+# 临时文件
+*.tmp
+*.temp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 调试
+__debug_bin*
+
+# 操作系统
+.DS_Store
+Thumbs.db
