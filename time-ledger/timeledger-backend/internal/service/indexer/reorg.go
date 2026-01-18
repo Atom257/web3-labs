@@ -301,7 +301,8 @@ func (ix *Indexer) rollbackTo(
 			Updates(map[string]any{
 				"block_number":      ancestor,
 				"block_hash":        ancestorHash,
-				"scan_block_number": ancestor, // 必须回退
+				"scan_block_number": ancestor,     // 必须回退
+				"last_block_time":   ancestorTime, // 回滚时也要修正时间。之前查出来的 ancestorTime
 				"updated_at":        now,
 			}).Error; err != nil {
 			return err
@@ -314,7 +315,7 @@ func (ix *Indexer) rollbackTo(
 		return err
 	}
 
-	//	DB 回滚成功后，再清理 Redis（新增代码）
+	//	DB 回滚成功后，再清理 Redis
 	if ix.redis != nil {
 		ix.CleanupPendingAfterReorg(
 			ctx,

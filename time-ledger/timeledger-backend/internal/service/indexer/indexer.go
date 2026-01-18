@@ -166,7 +166,13 @@ func (ix *Indexer) syncContract(
 
 	// 确保函数结束时清理内存 scanCache
 	defer func() {
-		key := fmt.Sprintf("%d:%s", chain.ChainID, contract.Address)
+		key := fmt.Sprintf(
+			"%s:%d:%s",
+			ix.cfg.Redis.KeyPrefix,
+			chain.ChainID,
+			contract.Address,
+		)
+
 		ix.scanMu.Lock()
 		delete(ix.scanCache, key)
 		ix.scanMu.Unlock()
@@ -259,7 +265,7 @@ func (ix *Indexer) syncContract(
 		ix.updateScanProgress(chain, contract, end)
 
 		// 周期性落库 scan_block_number（防止长扫中途重启）
-		if err := ix.flushScanCursor(chain, contract, &scanFlushed); err != nil {
+		if err := ix.flushScanCursor(ctx, client, chain, contract, &scanFlushed); err != nil {
 			return err
 		}
 
@@ -301,7 +307,7 @@ func (ix *Indexer) syncContract(
 	}
 
 	// 扫描结束后兜底刷新 scan cursor
-	if err := ix.flushScanCursor(chain, contract, &scanFlushed); err != nil {
+	if err := ix.flushScanCursor(ctx, client, chain, contract, &scanFlushed); err != nil {
 		return err
 	}
 
@@ -445,7 +451,12 @@ func (ix *Indexer) updateScanProgress(
 	contract config.ContractConfig,
 	end uint64,
 ) {
-	key := fmt.Sprintf("%d:%s", chain.ChainID, contract.Address)
+	key := fmt.Sprintf("%s:%d:%s",
+		ix.cfg.Redis.KeyPrefix,
+		chain.ChainID,
+		contract.Address,
+	)
+
 	ix.scanMu.Lock()
 	ix.scanCache[key] = int64(end)
 	ix.scanMu.Unlock()
@@ -453,17 +464,26 @@ func (ix *Indexer) updateScanProgress(
 
 // flushScanCursor 将内存中的扫描进度按需写入数据库，控制写频率。
 func (ix *Indexer) flushScanCursor(
+	ctx context.Context,
+	client *ethclient.Client,
 	chain config.ChainConfig,
 	contract config.ContractConfig,
 	scanFlushed *int64,
 ) error {
-	key := fmt.Sprintf("%d:%s", chain.ChainID, contract.Address)
+	key := fmt.Sprintf(
+		"%s:%d:%s",
+		ix.cfg.Redis.KeyPrefix,
+		chain.ChainID,
+		contract.Address,
+	)
 
 	ix.scanMu.Lock()
 	scan := ix.scanCache[key]
 	ix.scanMu.Unlock()
 
 	newFlushed, err := ix.maybeFlushScanCursor(
+		ctx,
+		client,
 		chain.ChainID,
 		contract.Address,
 		*scanFlushed,
@@ -771,9 +791,10 @@ func (ix *Indexer) applyChunkTx(
 		return tx.Model(&models.BlockCursor{}).
 			Where("chain_id=? AND contract_address=?", chainID, contract).
 			Updates(map[string]any{
-				"block_number": int64(end),
-				"block_hash":   endHeader.Hash.Hex(),
-				"updated_at":   time.Now().UTC(),
+				"block_number":    int64(end),
+				"block_hash":      endHeader.Hash.Hex(),
+				"last_block_time": endHeader.Time,
+				"updated_at":      time.Now().UTC(),
 			}).Error
 	})
 }
@@ -870,6 +891,8 @@ func (ix *Indexer) applyAccountDelta(
 }
 
 func (ix *Indexer) maybeFlushScanCursor(
+	ctx context.Context,
+	client *ethclient.Client,
 	chainID int64,
 	contract string,
 	lastFlushedScan int64,
@@ -878,7 +901,7 @@ func (ix *Indexer) maybeFlushScanCursor(
 ) (int64, error) {
 
 	// 默认情况下，使用500作为gap
-	scanFlushGap := int64(500)
+	scanFlushGap := int64(100)
 
 	// 如果是ethereum类型的链，直接跳过gap限制
 	if chainType == "ethereum" {
@@ -890,10 +913,43 @@ func (ix *Indexer) maybeFlushScanCursor(
 		return lastFlushedScan, nil
 	}
 
-	// 更新数据库中的 scan_block_number
+	// 如果是 OP Stack， 需要主动查时间，因为 handleOpStackChunk 不会更新时间
+	var lastBlockTime time.Time
+
+	if chainType == "opstack" {
+		h, err := callRPCWithRetry(
+			ctx,
+			ix.rpcLimiter,
+			"eth_getBlockByNumber",
+			chainID,
+			uint64(scanBlock),
+			func() (*types.Header, error) {
+				return client.HeaderByNumber(ctx, big.NewInt(scanBlock))
+			},
+		)
+		if err != nil {
+			// 如果查时间失败，不要阻断流程，只是这次不更新时间罢了
+			// 或者 return err 阻断也可以，看你对时间的严格程度。建议阻断，保证一致性。
+			return lastFlushedScan, err
+		}
+		lastBlockTime = time.Unix(int64(h.Time), 0).UTC()
+	}
+
+	// 构建更新 map
+	updates := map[string]any{
+		"scan_block_number": scanBlock,
+		"updated_at":        time.Now().UTC(),
+	}
+
+	// 如果查到了时间（OP Stack），顺便更新 last_block_time
+	if !lastBlockTime.IsZero() {
+		updates["last_block_time"] = lastBlockTime
+	}
+
+	// 更新数据库中的 scan_block_number、last_block_time
 	if err := ix.db.Model(&models.BlockCursor{}).
 		Where("chain_id=? AND contract_address=?", chainID, contract).
-		Update("scan_block_number", scanBlock).Error; err != nil {
+		Updates(updates).Error; err != nil { // 使用 Updates 而不是 Update
 		return lastFlushedScan, err
 	}
 

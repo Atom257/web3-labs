@@ -118,7 +118,9 @@ func (s *Service) runContract(ctx context.Context, chainID int64, contract strin
 	// 3) 对每个账户补算（从 last_calc_time 开始补到 now）
 	for _, acct := range accounts {
 		if err := s.calcOneAccount(ctx, chainID, contract, acct, now); err != nil {
-			return err
+			// 记录错误但不中断循环
+			log.Printf("[ERROR] calcOneAccount failed: chain=%d contract=%s account=%s err=%v", chainID, contract, acct, err)
+			continue
 		}
 	}
 
@@ -279,13 +281,14 @@ func (s *Service) safeBlockTime(
 ) (time.Time, error) {
 
 	type row struct {
-		BlockTime time.Time
+		LastBlockTime time.Time
 	}
 
 	var r row
+	// 查 block_cursor 表的last_block_time
 	err := s.db.WithContext(ctx).
-		Model(&models.BlockHeader{}).
-		Select("MAX(block_time) AS block_time").
+		Model(&models.BlockCursor{}).
+		Select("last_block_time").
 		Where("chain_id=? AND contract_address=?", chainID, contract).
 		Scan(&r).Error
 
@@ -293,9 +296,9 @@ func (s *Service) safeBlockTime(
 		return time.Time{}, err
 	}
 
-	if r.BlockTime.IsZero() {
+	if r.LastBlockTime.IsZero() {
 		return time.Time{}, fmt.Errorf("no safe block_time found")
 	}
 
-	return r.BlockTime.UTC(), nil
+	return r.LastBlockTime.UTC(), nil
 }

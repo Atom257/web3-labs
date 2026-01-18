@@ -13,6 +13,9 @@ type BlockCursor struct {
 	BlockNumber int64  `gorm:"not null"`
 	BlockHash   string `gorm:"type:char(66);not null"`
 
+	// 记录当前进度的区块时间
+	LastBlockTime time.Time `gorm:"type:datetime(6)"`
+
 	//	已完成 RPC 扫描的最高块（允许回退）
 	ScanBlockNumber int64 `gorm:"not null;default:0"`
 

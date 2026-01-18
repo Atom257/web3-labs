@@ -154,8 +154,7 @@ func (ix *Indexer) ListPendingBlocksUpTo(
 
 // FlushSafePending 将 Redis 中 <= 当前 safe block 的 pending 区块
 // 按区块高度顺序 apply 到数据库。
-//
-// 设计保证：
+
 // - 可重入（多次调用安全）
 // - 仅推进 canonical block（block_number / block_hash）
 // - 不修改 scan_block_number（扫描进度）
