@@ -94,6 +94,7 @@ func (s *Server) GetUserPoints(c *gin.Context) {
 		return
 	}
 
+	// UserPoint 目前是单一大表，不需要分表逻辑
 	var up models.UserPoint
 	err = s.db.
 		Where(
@@ -148,8 +149,20 @@ func (s *Server) GetUserPointLogs(c *gin.Context) {
 		}
 	}
 
+	// 1. 先查询 SysContract 获取 ID，从而确定表名
+	var sysC models.SysContract
+	if err := s.db.Where("chain_id = ? AND address = ?", chainID, contract).First(&sysC).Error; err != nil {
+		// 如果合约都找不到，肯定没有日志
+		c.JSON(http.StatusNotFound, gin.H{"error": "contract not configured"})
+		return
+	}
+
+	// 获取动态表名 (例如 user_point_log_1)
+	logTableName := sysC.GetLogTableName()
+
+	// 2. 使用 Table(logTableName) 查询
 	q := s.db.
-		Model(&models.UserPointLog{}).
+		Table(logTableName).
 		Where(
 			"chain_id=? AND contract_address=? AND account=?",
 			chainID, contract, account,
@@ -172,6 +185,9 @@ func (s *Server) GetUserPointLogs(c *gin.Context) {
 		Limit(limit).
 		Offset(offset).
 		Find(&logs).Error; err != nil {
+
+		// 如果表不存在（可能是刚添加合约还没算过分），返回空列表或报错均可
+		// 这里选择返回 500 暴露问题，或者你可以 check error 类型忽略 "table not found"
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

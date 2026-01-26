@@ -5,9 +5,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 
-	"github.com/Atom257/web3-labs/timeledger-backend/internal/config"
 	"github.com/Atom257/web3-labs/timeledger-backend/internal/models"
 )
 
@@ -136,51 +134,4 @@ func (r *pointRateRepo) Create(
 ) error {
 
 	return r.db.WithContext(ctx).Create(rate).Error
-}
-
-// EnsureDefaultPointRate 确保每个合约至少有一条积分规则
-// 如果已存在规则，则什么也不做
-func EnsureDefaultPointRate(
-	ctx context.Context,
-	db *gorm.DB,
-	cfg *config.Config,
-) error {
-
-	now := time.Now().UTC()
-
-	for _, chain := range cfg.Chains {
-		for _, c := range chain.Contracts {
-
-			rates := []models.PointRate{
-				// 初始积分规则：5%
-				{
-					ChainID:         chain.ChainID,
-					ContractAddress: c.Address,
-					RateNumerator:   5,
-					RateDenominator: 100,
-					EffectiveTime:   time.Unix(0, 0).UTC(),
-					CreatedAt:       now,
-				},
-				// 升级积分规则：8%
-				{
-					ChainID:         chain.ChainID,
-					ContractAddress: c.Address,
-					RateNumerator:   8,
-					RateDenominator: 100,
-					EffectiveTime:   time.Date(2026, 1, 15, 3, 1, 0, 0, time.UTC),
-					CreatedAt:       now,
-				},
-			}
-
-			for _, r := range rates {
-				if err := db.WithContext(ctx).
-					Clauses(clause.OnConflict{DoNothing: true}).
-					Create(&r).Error; err != nil {
-					return err
-				}
-			}
-		}
-	}
-
-	return nil
 }

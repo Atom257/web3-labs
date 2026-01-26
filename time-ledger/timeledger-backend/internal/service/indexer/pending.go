@@ -4,12 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"sort"
 	"time"
 
-	"github.com/Atom257/web3-labs/timeledger-backend/internal/config"
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/redis/go-redis/v9"
 )
@@ -98,8 +95,7 @@ func (ix *Indexer) StagePendingBlock(
 		return err
 	}
 
-	// pending 区块设置短 不过期。 防止时间过短还没落库已经被清楚
-	//  redis的清除 靠主动清除。
+	// pending 区块设置不设置过期时间，靠主动清除
 	return rdb.Set(ctx, key, data, 0).Err()
 }
 
@@ -150,105 +146,6 @@ func (ix *Indexer) ListPendingBlocksUpTo(
 	})
 
 	return blocks, nil
-}
-
-// FlushSafePending 将 Redis 中 <= 当前 safe block 的 pending 区块
-// 按区块高度顺序 apply 到数据库。
-
-// - 可重入（多次调用安全）
-// - 仅推进 canonical block（block_number / block_hash）
-// - 不修改 scan_block_number（扫描进度）
-// - 与 reorg 逻辑兼容
-func (ix *Indexer) FlushSafePending(
-	ctx context.Context,
-	client *ethclient.Client,
-	adapter ChainAdapter,
-	chain config.ChainConfig,
-	contract config.ContractConfig,
-	dbBlock *int64,
-) error {
-
-	// 重新获取最新 safe block（不能复用旧 snapshot）
-	safeBlock, err := adapter.SafeBlock(ctx, client, chain)
-	if err != nil {
-		return err
-	}
-
-	// 从 Redis 读取 <= safeBlock 的 pending 区块
-	pendingBlocks, err := ix.ListPendingBlocksUpTo(
-		ctx,
-		ix.redis,
-		chain.ChainID,
-		contract.Address,
-		safeBlock,
-	)
-	if err != nil {
-		return err
-	}
-
-	if len(pendingBlocks) == 0 {
-		return nil
-	}
-
-	// 确保按 block_number 升序（ListPendingBlocksUpTo 已排序，这里防御性再排一次）
-	sort.Slice(pendingBlocks, func(i, j int) bool {
-		return pendingBlocks[i].BlockNumber < pendingBlocks[j].BlockNumber
-	})
-
-	for _, pb := range pendingBlocks {
-
-		// 已经 apply 过的 block，直接跳过（防御）
-		if int64(pb.BlockNumber) <= *dbBlock {
-			continue
-		}
-
-		headers := map[uint64]*blockHeaderMini{
-			pb.BlockNumber: {
-				Number: pb.BlockNumber,
-				Hash:   common.HexToHash(pb.BlockHash),
-				Parent: common.HexToHash(pb.ParentHash),
-				Time:   pb.BlockTime,
-			},
-		}
-
-		log.Printf(
-			"[opstack.flush.safe] chain=%d contract=%s block=%d events=%d safe=%d",
-			chain.ChainID,
-			contract.Address,
-			pb.BlockNumber,
-			len(pb.Events),
-			safeBlock,
-		)
-
-		// apply 到数据库（会推进 block_cursor.block_number / block_hash）
-		if err := ix.applyChunkTx(
-			ctx,
-			client,
-			chain.ChainID,
-			contract.Address,
-			pb.BlockNumber,
-			pb.BlockNumber,
-			pb.Events,
-			headers,
-		); err != nil {
-			return err
-		}
-
-		// 更新外部 dbBlock（供调用方使用）
-		*dbBlock = int64(pb.BlockNumber)
-
-		// apply 成功后，删除 Redis pending
-		key := fmt.Sprintf(
-			"%s:pending:block:%d:%s:%d",
-			ix.cfg.Redis.KeyPrefix,
-			chain.ChainID,
-			contract.Address,
-			pb.BlockNumber,
-		)
-		_ = ix.redis.Del(ctx, key).Err()
-	}
-
-	return nil
 }
 
 // CleanupPendingAfterReorg

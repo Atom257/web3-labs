@@ -4,13 +4,13 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/Atom257/web3-labs/timeledger-backend/internal/config"
+	"github.com/Atom257/web3-labs/timeledger-backend/internal/models"
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
 type OpStackAdapter struct{}
 
-func (a *OpStackAdapter) SafeBlock(ctx context.Context, client *ethclient.Client, chain config.ChainConfig) (uint64, error) {
+func (a *OpStackAdapter) SafeBlock(ctx context.Context, client *ethclient.Client, chain models.SysChain) (uint64, error) {
 	head, err := client.BlockNumber(ctx)
 	if err != nil {
 		return 0, err

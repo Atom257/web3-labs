@@ -21,6 +21,7 @@ import (
 
 	"github.com/Atom257/web3-labs/timeledger-backend/internal/config"
 	"github.com/Atom257/web3-labs/timeledger-backend/internal/models"
+	"github.com/Atom257/web3-labs/timeledger-backend/internal/repository"
 	erc20 "github.com/Atom257/web3-labs/timeledger-backend/pkg/contract/erc20"
 )
 
@@ -55,64 +56,93 @@ func New(db *gorm.DB, cfg *config.Config, rdb *redis.Client) *Indexer {
 }
 
 /*
-RunOnce
+RunOnceConcurrent
 -------
-对所有 chain / contract 执行一次同步。
-一旦遇到 RPC rate limit，立即终止。
+并行执行：
+1. 从数据库获取 Active 的合约
+2. 从 Config 获取 RPC URL (loader.go 已注入)
+3. 按链分组并行执行
 */
-func (ix *Indexer) RunOnce(ctx context.Context) error {
-	for _, chain := range ix.cfg.Chains {
-
-		adapter, err := AdapterFor(chain.Type)
-		if err != nil {
-			return err
-		}
-
-		client, err := ethclient.Dial(chain.RPCURL)
-		if err != nil {
-			return err
-		}
-
-		for _, contract := range chain.Contracts {
-			err := ix.syncContract(ctx, client, adapter, chain, contract)
-			if err != nil {
-				if errors.Is(err, ErrRateLimited) {
-					log.Printf(
-						"[indexer.fatal] chain_id=%d contract=%s reason=rpc_rate_limited action=exit",
-						chain.ChainID,
-						contract.Address,
-					)
-				}
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-// 每条链单独indexer
 func (ix *Indexer) RunOnceConcurrent(ctx context.Context) error {
+	// 1. 获取所有待索引的合约 (DB)
+	contracts, err := repository.GetActiveContracts(ctx, ix.db)
+	if err != nil {
+		return fmt.Errorf("load active contracts failed: %w", err)
+	}
+
+	if len(contracts) == 0 {
+		return nil
+	}
+
+	// 2. 获取所有链配置 (DB) 用于获取 Type, ReorgWindow 等
+	var chains []models.SysChain
+	if err := ix.db.Find(&chains).Error; err != nil {
+		return fmt.Errorf("load chains failed: %w", err)
+	}
+	sysChainMap := make(map[int64]models.SysChain)
+	for _, c := range chains {
+		sysChainMap[c.ChainID] = c
+	}
+
+	// 3. 构建 RPC URL 映射 (Memory Config)
+	// loader.go 启动时已经把 env 里的 URL 填进 ix.cfg 了，直接用
+	chainRpcMap := make(map[int64]string)
+	for _, c := range ix.cfg.Chains {
+		chainRpcMap[c.ChainID] = c.RPCURL
+	}
+
+	// 4. 按 ChainID 分组合约
+	contractGroups := make(map[int64][]models.SysContract)
+	for _, c := range contracts {
+		contractGroups[c.ChainID] = append(contractGroups[c.ChainID], c)
+	}
+
+	// 5. 并发执行
 	g, ctx := errgroup.WithContext(ctx)
 
-	for _, chain := range ix.cfg.Chains {
-		chain := chain // 必须 copy，避免闭包问题
+	for chainID, targets := range contractGroups {
+		chainID := chainID
+		targets := targets
+
+		// 获取 DB 里的链配置
+		sysChain, ok := sysChainMap[chainID]
+		if !ok {
+			log.Printf("[Indexer] warn: chain_id=%d not found in sys_chains, skipping", chainID)
+			continue
+		}
 
 		g.Go(func() error {
-			adapter, err := AdapterFor(chain.Type)
+			// 获取 RPC URL
+			rpcURL := chainRpcMap[chainID]
+			if rpcURL == "" {
+				// 如果 Config 里找不到 URL，说明 loader 没加载到，可能是新加的链没配 env
+				return fmt.Errorf("chain %s (id=%d) missing rpc url in config", sysChain.Name, chainID)
+			}
+
+			// 初始化 Adapter
+			adapter, err := AdapterFor(sysChain.Type)
 			if err != nil {
 				return err
 			}
 
-			client, err := ethclient.Dial(chain.RPCURL)
+			// 连接 RPC
+			client, err := ethclient.Dial(rpcURL)
 			if err != nil {
-				return err
+				return fmt.Errorf("dial rpc failed chain=%d: %w", chainID, err)
 			}
 			defer client.Close()
 
-			// 注意：这里还是「链内串行」
-			for _, contract := range chain.Contracts {
-				if err := ix.syncContract(ctx, client, adapter, chain, contract); err != nil {
-					return err
+			// 链内串行处理合约
+			for _, contract := range targets {
+				// 【关键】这里传的是 models.SysChain 和 models.SysContract
+				if err := ix.syncContract(ctx, client, adapter, sysChain, contract); err != nil {
+					// 遇到限流，中断该链
+					if errors.Is(err, ErrRateLimited) {
+						log.Printf("[indexer.exit] rate limited on chain %d", chainID)
+						return err
+					}
+					// 其他错误，记录日志但不中断其他合约
+					log.Printf("[Indexer] sync failed contract=%s: %v", contract.Address, err)
 				}
 			}
 			return nil
@@ -122,33 +152,14 @@ func (ix *Indexer) RunOnceConcurrent(ctx context.Context) error {
 	return g.Wait()
 }
 
-// syncContract 是 indexer 的核心编排函数，负责单条 chain + contract 的完整同步流程。
-//
-// 设计要点：
-// 1. 扫描与落库解耦：
-//   - 扫描进度通过 scanCache / scan_block_number 推进
-//   - canonical 状态仅在确认后推进 block_number
-//
-// 2. OP Stack 特殊处理：
-//   - 扫描阶段只写 Redis pending，不直接落库
-//   - 仅对 <= safe block 的 pending 区块执行落库
-//   - pending 可被多次 flush，保证首次大区间扫描不中断
-//
-// 3. 顺序与一致性：
-//   - 所有区块处理按 block_number 单调递增
-//   - reorg 检测只依赖已落库的 canonical block
-//
-// 4. 资源与生命周期：
-//   - scanCache 为函数级临时状态，函数结束必须清理
-//   - 所有 DB 写入在 chunk 边界或 safe flush 时完成
-//
-// 本函数只负责编排流程，具体实现细节下沉到子函数中。
+// syncContract 是 indexer 的核心编排函数
+// 参数已全部修改为 models.SysChain 和 models.SysContract
 func (ix *Indexer) syncContract(
 	ctx context.Context,
 	client *ethclient.Client,
 	adapter ChainAdapter,
-	chain config.ChainConfig,
-	contract config.ContractConfig,
+	chain models.SysChain,
+	contract models.SysContract,
 ) error {
 
 	log.Printf(
@@ -196,18 +207,19 @@ func (ix *Indexer) syncContract(
 
 	// OP Stack：reorg 检测与回滚
 	if chain.Type == "opstack" {
+		//  ReorgWindow 是 int，需转 int64
 		if err := ix.EnsureCanonicalOrRollback(
 			ctx,
 			client,
 			chain.ChainID,
 			contract.Address,
-			chain.ReorgWindow,
+			int64(chain.ReorgWindow),
 		); err != nil {
 			return err
 		}
 	}
 
-	// 当前 safe block
+	// 当前 safe block (Adapter 已适配 models.SysChain)
 	safeBlock, err := adapter.SafeBlock(ctx, client, chain)
 	if err != nil {
 		return err
@@ -264,14 +276,13 @@ func (ix *Indexer) syncContract(
 		// 更新内存 scan 进度
 		ix.updateScanProgress(chain, contract, end)
 
-		// 周期性落库 scan_block_number（防止长扫中途重启）
+		// 周期性落库 scan_block_number
 		if err := ix.flushScanCursor(ctx, client, chain, contract, &scanFlushed); err != nil {
 			return err
 		}
 
 		if chain.Type == "opstack" && ix.redis != nil {
-
-			// OP Stack：写 Redis pending，并周期性 flush safe 区块
+			// OP Stack：写 Redis pending
 			if err := ix.handleOpStackChunk(
 				ctx,
 				client,
@@ -284,9 +295,7 @@ func (ix *Indexer) syncContract(
 			); err != nil {
 				return err
 			}
-
 		} else {
-
 			// 非 OP Stack：直接落库
 			if err := ix.applyNormalChunk(
 				ctx,
@@ -328,14 +337,13 @@ func (ix *Indexer) syncContract(
 	return nil
 }
 
-// handleOpStackChunk 处理 OP Stack 扫描到的一个 chunk：
-// 将区块与事件写入 Redis pending，并尝试刷新已 safe 的区块到数据库。
+// handleOpStackChunk 处理 OP Stack 扫描到的一个 chunk
 func (ix *Indexer) handleOpStackChunk(
 	ctx context.Context,
 	client *ethclient.Client,
 	adapter ChainAdapter,
-	chain config.ChainConfig,
-	contract config.ContractConfig,
+	chain models.SysChain,
+	contract models.SysContract,
 	headers map[uint64]*blockHeaderMini,
 	events []TransferEvent,
 	dbBlock *int64,
@@ -376,6 +384,7 @@ func (ix *Indexer) handleOpStackChunk(
 		}
 	}
 
+	//  递归调用 FlushSafePending
 	return ix.FlushSafePending(
 		ctx,
 		client,
@@ -386,13 +395,101 @@ func (ix *Indexer) handleOpStackChunk(
 	)
 }
 
-// applyNormalChunk 处理非 OP Stack 链的一个 chunk：
-// 直接将区块与事件落库，并推进 canonical block。
+// FlushSafePending 将 Redis 中 <= 当前 safe block 的 pending 区块落库
+func (ix *Indexer) FlushSafePending(
+	ctx context.Context,
+	client *ethclient.Client,
+	adapter ChainAdapter,
+	chain models.SysChain,
+	contract models.SysContract,
+	dbBlock *int64,
+) error {
+
+	// 1. 获取最新 safe block
+	safeBlock, err := adapter.SafeBlock(ctx, client, chain)
+	if err != nil {
+		return err
+	}
+
+	// 2. 从 Redis 读取 pending blocks
+	pendingBlocks, err := ix.ListPendingBlocksUpTo(
+		ctx,
+		ix.redis,
+		chain.ChainID,
+		contract.Address,
+		safeBlock,
+	)
+	if err != nil {
+		return err
+	}
+
+	if len(pendingBlocks) == 0 {
+		return nil
+	}
+
+	sort.Slice(pendingBlocks, func(i, j int) bool {
+		return pendingBlocks[i].BlockNumber < pendingBlocks[j].BlockNumber
+	})
+
+	for _, pb := range pendingBlocks {
+		if int64(pb.BlockNumber) <= *dbBlock {
+			continue
+		}
+
+		headers := map[uint64]*blockHeaderMini{
+			pb.BlockNumber: {
+				Number: pb.BlockNumber,
+				Hash:   common.HexToHash(pb.BlockHash),
+				Parent: common.HexToHash(pb.ParentHash),
+				Time:   pb.BlockTime,
+			},
+		}
+
+		log.Printf(
+			"[opstack.flush.safe] chain=%d contract=%s block=%d events=%d safe=%d",
+			chain.ChainID,
+			contract.Address,
+			pb.BlockNumber,
+			len(pb.Events),
+			safeBlock,
+		)
+
+		// 3. 落库
+		if err := ix.applyChunkTx(
+			ctx,
+			client,
+			chain.ChainID,
+			contract.Address,
+			pb.BlockNumber,
+			pb.BlockNumber,
+			pb.Events,
+			headers,
+		); err != nil {
+			return err
+		}
+
+		*dbBlock = int64(pb.BlockNumber)
+
+		// 4. 清理 Redis
+		key := fmt.Sprintf(
+			"%s:pending:block:%d:%s:%d",
+			ix.cfg.Redis.KeyPrefix,
+			chain.ChainID,
+			contract.Address,
+			pb.BlockNumber,
+		)
+		_ = ix.redis.Del(ctx, key).Err()
+	}
+
+	return nil
+}
+
+// applyNormalChunk 处理非 OP Stack 链的一个 chunk
 func (ix *Indexer) applyNormalChunk(
 	ctx context.Context,
 	client *ethclient.Client,
-	chain config.ChainConfig,
-	contract config.ContractConfig,
+	chain models.SysChain,
+	contract models.SysContract,
 	start, end uint64,
 	events []TransferEvent,
 	headers map[uint64]*blockHeaderMini,
@@ -417,7 +514,7 @@ func (ix *Indexer) applyNormalChunk(
 	return nil
 }
 
-// computeScanRange 根据 cursor 状态计算本次需要扫描的区块范围。
+// computeScanRange 根据 cursor 状态计算本次需要扫描的区块范围
 func (ix *Indexer) computeScanRange(
 	cursor *models.BlockCursor,
 	safeBlock uint64,
@@ -431,24 +528,25 @@ func (ix *Indexer) computeScanRange(
 	return uint64(startFrom + 1), safeBlock
 }
 
-// computeChunkEnd 根据 chunkSize 计算当前扫描 chunk 的结束区块。
+// computeChunkEnd 根据 chunkSize 计算当前扫描 chunk 的结束区块
 func (ix *Indexer) computeChunkEnd(
 	start uint64,
 	applyTo uint64,
-	chain config.ChainConfig,
+	chain models.SysChain,
 ) uint64 {
 
-	end := start + chain.ChunkSize - 1
+	// ChunkSize 在 DB model 里是 int，需转换
+	end := start + uint64(chain.ChunkSize) - 1
 	if end > applyTo {
 		end = applyTo
 	}
 	return end
 }
 
-// updateScanProgress 更新内存中的扫描进度，用于长时间扫描过程中的容错恢复。
+// updateScanProgress 更新内存中的扫描进度
 func (ix *Indexer) updateScanProgress(
-	chain config.ChainConfig,
-	contract config.ContractConfig,
+	chain models.SysChain,
+	contract models.SysContract,
 	end uint64,
 ) {
 	key := fmt.Sprintf("%s:%d:%s",
@@ -462,12 +560,12 @@ func (ix *Indexer) updateScanProgress(
 	ix.scanMu.Unlock()
 }
 
-// flushScanCursor 将内存中的扫描进度按需写入数据库，控制写频率。
+// flushScanCursor 将内存中的扫描进度按需写入数据库
 func (ix *Indexer) flushScanCursor(
 	ctx context.Context,
 	client *ethclient.Client,
-	chain config.ChainConfig,
-	contract config.ContractConfig,
+	chain models.SysChain,
+	contract models.SysContract,
 	scanFlushed *int64,
 ) error {
 	key := fmt.Sprintf(
@@ -498,11 +596,11 @@ func (ix *Indexer) flushScanCursor(
 	return nil
 }
 
-// ensureCursorHash 在初始化 cursor 缺失 block_hash 时补齐对应区块哈希。
+// ensureCursorHash 在初始化 cursor 缺失 block_hash 时补齐
 func (ix *Indexer) ensureCursorHash(
 	ctx context.Context,
 	client *ethclient.Client,
-	chain config.ChainConfig,
+	chain models.SysChain,
 	cursor *models.BlockCursor,
 ) error {
 
@@ -540,7 +638,7 @@ Cursor
 
 func (ix *Indexer) loadOrInitCursor(
 	chainID int64,
-	contract config.ContractConfig,
+	contract models.SysContract,
 ) (*models.BlockCursor, error) {
 
 	var cursor models.BlockCursor
@@ -556,9 +654,11 @@ func (ix *Indexer) loadOrInitCursor(
 		cursor = models.BlockCursor{
 			ChainID:         chainID,
 			ContractAddress: contract.Address,
-			BlockNumber:     contract.StartBlock - 1,
-			BlockHash:       "",
-			UpdatedAt:       time.Now().UTC(),
+			// DB 中 StartBlock 是 int64，可以直接赋值
+			BlockNumber:   contract.StartBlock - 1,
+			BlockHash:     "",
+			LastBlockTime: time.Unix(0, 0).UTC(),
+			UpdatedAt:     time.Now().UTC(),
 		}
 		if err := ix.db.Create(&cursor).Error; err != nil {
 			return nil, err
@@ -900,20 +1000,19 @@ func (ix *Indexer) maybeFlushScanCursor(
 	chainType string,
 ) (int64, error) {
 
-	// 默认情况下，使用500作为gap
+	// 默认 gap
 	scanFlushGap := int64(100)
 
-	// 如果是ethereum类型的链，直接跳过gap限制
+	// Ethereum 可设为 0（立即更新）或保持 100
 	if chainType == "ethereum" {
-		scanFlushGap = 0 // 对于 Ethereum 链，设置为 0，立即更新
+		scanFlushGap = 0
 	}
 
-	// 如果区块间的差距小于 scanFlushGap，则不进行更新
 	if scanBlock-lastFlushedScan < scanFlushGap {
 		return lastFlushedScan, nil
 	}
 
-	// 如果是 OP Stack， 需要主动查时间，因为 handleOpStackChunk 不会更新时间
+	// OP Stack：主动查时间
 	var lastBlockTime time.Time
 
 	if chainType == "opstack" {
@@ -928,28 +1027,23 @@ func (ix *Indexer) maybeFlushScanCursor(
 			},
 		)
 		if err != nil {
-			// 如果查时间失败，不要阻断流程，只是这次不更新时间罢了
-			// 或者 return err 阻断也可以，看你对时间的严格程度。建议阻断，保证一致性。
 			return lastFlushedScan, err
 		}
 		lastBlockTime = time.Unix(int64(h.Time), 0).UTC()
 	}
 
-	// 构建更新 map
 	updates := map[string]any{
 		"scan_block_number": scanBlock,
 		"updated_at":        time.Now().UTC(),
 	}
 
-	// 如果查到了时间（OP Stack），顺便更新 last_block_time
 	if !lastBlockTime.IsZero() {
 		updates["last_block_time"] = lastBlockTime
 	}
 
-	// 更新数据库中的 scan_block_number、last_block_time
 	if err := ix.db.Model(&models.BlockCursor{}).
 		Where("chain_id=? AND contract_address=?", chainID, contract).
-		Updates(updates).Error; err != nil { // 使用 Updates 而不是 Update
+		Updates(updates).Error; err != nil {
 		return lastFlushedScan, err
 	}
 

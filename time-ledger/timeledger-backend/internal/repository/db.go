@@ -10,7 +10,6 @@ import (
 	"gorm.io/gorm/logger"
 
 	"github.com/Atom257/web3-labs/timeledger-backend/internal/config"
-	"github.com/Atom257/web3-labs/timeledger-backend/internal/models"
 )
 
 // InitDB 初始化数据库连接
@@ -71,26 +70,7 @@ func InitDB(cfg config.DatabaseConfig) (*gorm.DB, error) {
 	}
 	sqlDB.SetConnMaxLifetime(1 * time.Hour)
 
-	// 自动创建或更新表结构
-	if err := autoMigrate(db); err != nil {
-		return nil, fmt.Errorf("自动建表失败: %w", err)
-	}
-
 	return db, nil
-}
-
-// autoMigrate 自动创建或更新数据库表结构
-// 根据模型定义自动生成表和索引
-func autoMigrate(db *gorm.DB) error {
-	return db.AutoMigrate(
-		&models.BlockCursor{},  // 区块同步游标
-		&models.BlockHeader{},  // 区块头信息
-		&models.BalanceLog{},   // 余额变动日志
-		&models.UserBalance{},  // 用户余额快照
-		&models.UserPoint{},    // 用户积分
-		&models.UserPointLog{}, // 用户积分日志
-		&models.PointRate{},    // 积分率配置
-	)
 }
 
 // getEnv 从环境变量获取配置值
