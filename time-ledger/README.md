@@ -1,7 +1,18 @@
 # Time Ledger - 多链 ERC20 时间加权积分系统
 
 > 基于持仓时间和余额计算积分的区块链索引系统
+> **该项目以“时间加权积分”为业务载体，用于验证多链 Indexer 在并发、Reorg、幂等性和数据一致性场景下的工程实现。**
+> 
+## 👀 Infra 速读（3–5 分钟）
 
+如果你关注的是 Web3 Infra / Indexer 相关能力，可重点查看以下部分：
+
+- **多链并发 Indexer 实现**：Part 2 → Indexer（事件索引器）
+- **区块重组（Reorg）处理与回滚机制**：Part 2 → 区块重组处理流程
+- **幂等性与一致性保障**：2.3 并发安全机制
+- **大规模数据下的分表设计**：为什么 user_point_log 要分表？
+
+  
 ## 📖 目录
 - [项目简介](#项目简介)
 - [核心特性](#核心特性)
@@ -162,6 +173,9 @@ cast call $CONTRACT_ADDRESS \
 ```
 
 ---
+
+> 本部分重点展示多链 Indexer 在真实运行环境下的并发模型、  
+> 区块重组（Reorg）处理逻辑，以及高并发写入场景下的数据一致性保障。
 
 # Part 2: Go 后端服务
 
@@ -467,6 +481,10 @@ if err := g.Wait(); err != nil {
 | `point_rate` | 积分费率配置 | 4 | (chain_id, contract, effective_time) |
 | `sys_chains` | 链配置 | 2 | (chain_id) |
 | `sys_contracts` | 合约配置 | 2 | (chain_id, address) |
+
+
+> 以下设计基于生产规模模拟，用于说明在多链 Indexer 场景下，  
+> 数据规模增长时，数据结构对性能、稳定性和故障隔离能力的影响。
 
 ## 为什么 user_point_log 要分表？
 
