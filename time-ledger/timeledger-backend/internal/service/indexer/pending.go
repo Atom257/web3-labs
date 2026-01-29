@@ -163,7 +163,8 @@ func (ix *Indexer) CleanupPendingAfterReorg(
 	}
 
 	pattern := fmt.Sprintf(
-		"pending:block:%d:%s:*",
+		"%s:pending:block:%d:%s:*",
+		ix.cfg.Redis.KeyPrefix,
 		chainID,
 		contract,
 	)
